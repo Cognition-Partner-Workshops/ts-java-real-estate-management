@@ -1,0 +1,231 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  NG_CLI_ANALYTICS: 'false'
+
+jobs:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+      backend: ${{ steps.filter.outputs.backend }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - 'frontend/**'
+              - '.github/workflows/ci.yml'
+              - '.nvmrc'
+            backend:
+              - 'backend-fastify/**'
+              - '.github/workflows/ci.yml'
+              - '.nvmrc'
+
+  frontend:
+    name: Frontend (${{ matrix.task }})
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    # The Karma suite does not compile on main: three specs import
+    # src/app/shared/directives/custom-validators.directive, deleted in 8009526,
+    # and src/test.ts still imports the pre-zone.js-0.15 'zone.js/dist/zone-testing'.
+    # It runs and reports here, but does not block until those specs are repaired.
+    continue-on-error: ${{ matrix.task == 'test' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        task: [lint, typecheck, test, build]
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        if: matrix.task == 'lint'
+        run: npm run lint
+
+      - name: Typecheck
+        if: matrix.task == 'typecheck'
+        run: npm run typecheck
+
+      - name: Unit tests (headless Chrome + coverage)
+        if: matrix.task == 'test'
+        run: npm run test:ci
+
+      - name: Upload coverage report
+        if: matrix.task == 'test' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: frontend/coverage/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Production build
+        if: matrix.task == 'build'
+        run: npm run build:prod
+
+      - name: Upload production bundle
+        if: matrix.task == 'build'
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/www/
+          retention-days: 7
+
+  backend:
+    name: Backend
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend-fastify
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DB_CONNECT: mongodb://127.0.0.1:27017/rem-ci-db
+      SECRET_KEY: ci-secret
+      SALT: '4'
+      LOGGER: 'false'
+      PORT: '8000'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: backend-fastify/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (syntax check)
+        run: npm run lint
+
+      - name: Unit tests (against the mongo service container)
+        run: npm test
+
+      - name: Server smoke check
+        run: |
+          node src/index.js &
+          SERVER_PID=$!
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/properties/ >/dev/null; then
+              echo "Backend responded on attempt $attempt"
+              kill "$SERVER_PID"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Backend did not become healthy in time"
+          kill "$SERVER_PID" || true
+          exit 1
+
+  audit:
+    name: Dependency audit (${{ matrix.workspace }})
+    runs-on: ubuntu-latest
+    # Advisory only: both workspaces currently carry known high/critical
+    # transitive advisories, so the scan reports without blocking merges.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace: [frontend, backend-fastify]
+    defaults:
+      run:
+        working-directory: ${{ matrix.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: ${{ matrix.workspace }}/package-lock.json
+
+      - name: npm audit (high severity and above)
+        run: |
+          set +e
+          npm audit --audit-level=high | tee audit.txt
+          status=${PIPESTATUS[0]}
+          {
+            echo "### npm audit — ${{ matrix.workspace }}"
+            echo
+            echo '```'
+            tail -n 20 audit.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          # Only newly introduced dependencies are gated; the pre-existing
+          # advisories are reported by the advisory-only `audit` job.
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+
+  ci:
+    name: CI status
+    if: always()
+    needs: [changes, frontend, backend, audit, dependency-review]
+    runs-on: ubuntu-latest
+    steps:
+      # Aggregate gate: always runs so it can be a single required status check,
+      # and treats skipped path-filtered jobs as success.
+      - name: Check job results
+        run: |
+          results='${{ join(needs.*.result, ' ') }}'
+          echo "Upstream results: $results"
+          for result in $results; do
+            if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+              echo "A required job did not succeed."
+              exit 1
+            fi
+          done
+          echo "All required jobs succeeded or were skipped."

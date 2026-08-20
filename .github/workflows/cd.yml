@@ -1,0 +1,201 @@
+name: CD (mocked AWS deploy)
+
+# DEMO PIPELINE — every AWS identifier below is a placeholder and no step is
+# allowed to touch real infrastructure. Guards, in order:
+#   1. workflow_dispatch only (never on push/merge).
+#   2. DRY_RUN input defaults to true; a dry run only prints the commands.
+#   3. A real run additionally requires the repository variable
+#      ALLOW_REAL_DEPLOY == 'true' (unset in this demo repo), so leaving the
+#      input at false still stops before any AWS call.
+# Replace the placeholders in `env` with real values, create the OIDC role, and
+# set ALLOW_REAL_DEPLOY before using this against an actual account.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [staging, production]
+        default: staging
+      dry_run:
+        description: Print the deploy commands instead of executing them
+        type: boolean
+        default: true
+
+concurrency:
+  group: cd-${{ github.ref }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # ---- MOCKED PLACEHOLDERS (not real AWS resources) ----
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: '123456789012'
+  ECR_REGISTRY: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY_FRONTEND: demo-real-estate/frontend
+  ECR_REPOSITORY_BACKEND: demo-real-estate/backend
+  ECS_CLUSTER: demo-real-estate-cluster
+  ECS_SERVICE_FRONTEND: demo-real-estate-frontend
+  ECS_SERVICE_BACKEND: demo-real-estate-backend
+  K8S_NAMESPACE: demo-real-estate
+  OIDC_ROLE_ARN: arn:aws:iam::123456789012:role/demo-real-estate-github-deploy
+  STATIC_BUCKET: s3://demo-real-estate-web
+  CLOUDFRONT_DISTRIBUTION_ID: E123456789ABCD
+  # ------------------------------------------------------
+
+jobs:
+  build-images:
+    name: Build container images
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: frontend
+            context: frontend
+          - component: backend
+            context: backend-fastify
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Images are built for real (so the Dockerfiles stay honest) but only
+      # exported to the runner — nothing is pushed from this job.
+      - name: Build ${{ matrix.component }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: false
+          load: true
+          tags: ${{ matrix.component }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+      - name: Export image tarball
+        run: docker save ${{ matrix.component }}:${{ github.sha }} | gzip > ${{ matrix.component }}-image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.component }}-image
+          path: ${{ matrix.component }}-image.tar.gz
+          retention-days: 3
+
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    needs: build-images
+    runs-on: ubuntu-latest
+    # `production` should be configured with required reviewers in
+    # Settings → Environments so promotion waits for manual approval.
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write # required for AWS OIDC
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve deploy mode
+        id: mode
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "mode=dry-run" >> "$GITHUB_OUTPUT"
+          elif [ "${{ vars.ALLOW_REAL_DEPLOY }}" != "true" ]; then
+            echo "::warning::dry_run=false but repository variable ALLOW_REAL_DEPLOY is not 'true' — staying in dry-run mode."
+            echo "mode=dry-run" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=live" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Only reached when the repo is explicitly opted in to real deploys.
+      # The role ARN above is a placeholder, so this is never exercised here.
+      - name: Configure AWS credentials (OIDC)
+        if: steps.mode.outputs.mode == 'live'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.OIDC_ROLE_ARN }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        if: steps.mode.outputs.mode == 'live'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-image'
+          merge-multiple: true
+
+      - name: Push images to ECR
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+        run: |
+          set -euo pipefail
+          for component in frontend backend; do
+            case "$component" in
+              frontend) repo="$ECR_REPOSITORY_FRONTEND" ;;
+              backend)  repo="$ECR_REPOSITORY_BACKEND" ;;
+            esac
+            target="$ECR_REGISTRY/$repo:${{ github.sha }}"
+            echo "docker load < ${component}-image.tar.gz"
+            echo "docker tag ${component}:${{ github.sha }} $target"
+            echo "docker push $target"
+            if [ "$MODE" = "live" ]; then
+              gunzip -c "${component}-image.tar.gz" | docker load
+              docker tag "${component}:${{ github.sha }}" "$target"
+              docker push "$target"
+            fi
+          done
+          if [ "$MODE" = "dry-run" ]; then echo "::notice::DRY RUN — no images were pushed to $ECR_REGISTRY"; fi
+
+      - name: Deploy to Amazon ECS
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+        run: |
+          set -euo pipefail
+          for service in "$ECS_SERVICE_FRONTEND" "$ECS_SERVICE_BACKEND"; do
+            echo "aws ecs update-service --cluster $ECS_CLUSTER --service $service --force-new-deployment --region $AWS_REGION"
+            if [ "$MODE" = "live" ]; then
+              aws ecs update-service \
+                --cluster "$ECS_CLUSTER" \
+                --service "$service" \
+                --force-new-deployment \
+                --region "$AWS_REGION"
+              aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$service" --region "$AWS_REGION"
+            fi
+          done
+          # EKS alternative (also mocked), kept for reference:
+          #   aws eks update-kubeconfig --name demo-real-estate-eks --region $AWS_REGION
+          #   kubectl -n $K8S_NAMESPACE set image deploy/frontend frontend=$ECR_REGISTRY/$ECR_REPOSITORY_FRONTEND:${{ github.sha }}
+          #   kubectl -n $K8S_NAMESPACE set image deploy/backend backend=$ECR_REGISTRY/$ECR_REPOSITORY_BACKEND:${{ github.sha }}
+          if [ "$MODE" = "dry-run" ]; then echo "::notice::DRY RUN — cluster $ECS_CLUSTER was not modified"; fi
+
+      # Optional static-hosting path: publish the Angular bundle to S3 behind
+      # CloudFront instead of running the nginx container. Also fully mocked.
+      - name: Publish Angular bundle to S3 + CloudFront (optional path)
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+        run: |
+          set -euo pipefail
+          echo "aws s3 sync frontend/www/ $STATIC_BUCKET/ --delete"
+          echo "aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_DISTRIBUTION_ID --paths '/*'"
+          if [ "$MODE" = "live" ]; then
+            aws s3 sync frontend/www/ "$STATIC_BUCKET/" --delete
+            aws cloudfront create-invalidation --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" --paths '/*'
+          fi
+          if [ "$MODE" = "dry-run" ]; then echo "::notice::DRY RUN — $STATIC_BUCKET was not modified"; fi
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "### Deploy to ${{ inputs.environment }}"
+            echo
+            echo "- Mode: **${{ steps.mode.outputs.mode }}**"
+            echo "- Image tag: \`${{ github.sha }}\`"
+            echo "- Registry (mocked): \`$ECR_REGISTRY\`"
+            echo "- ECS cluster (mocked): \`$ECS_CLUSTER\`"
+            echo "- Namespace (mocked): \`$K8S_NAMESPACE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
