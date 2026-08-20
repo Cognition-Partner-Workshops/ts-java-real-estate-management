@@ -43,11 +43,6 @@ jobs:
     needs: changes
     if: needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
-    # The Karma suite does not compile on main: three specs import
-    # src/app/shared/directives/custom-validators.directive, deleted in 8009526,
-    # and src/test.ts still imports the pre-zone.js-0.15 'zone.js/dist/zone-testing'.
-    # It runs and reports here, but does not block until those specs are repaired.
-    continue-on-error: ${{ matrix.task == 'test' }}
     strategy:
       fail-fast: false
       matrix:
@@ -75,8 +70,13 @@ jobs:
         if: matrix.task == 'typecheck'
         run: npm run typecheck
 
+      # The Karma suite does not compile on main: three specs import
+      # src/app/shared/directives/custom-validators.directive, deleted in 8009526,
+      # and src/test.ts still imports the pre-zone.js-0.15 'zone.js/dist/zone-testing'.
+      # It runs and reports here, but does not block until those specs are repaired.
       - name: Unit tests (headless Chrome + coverage)
         if: matrix.task == 'test'
+        continue-on-error: true
         run: npm run test:ci
 
       - name: Upload coverage report
@@ -161,9 +161,6 @@ jobs:
   audit:
     name: Dependency audit (${{ matrix.workspace }})
     runs-on: ubuntu-latest
-    # Advisory only: both workspaces currently carry known high/critical
-    # transitive advisories, so the scan reports without blocking merges.
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -180,6 +177,10 @@ jobs:
           cache: npm
           cache-dependency-path: ${{ matrix.workspace }}/package-lock.json
 
+      # Advisory only: both workspaces already carry known high/critical
+      # transitive advisories, so findings are annotated and written to the job
+      # summary instead of blocking merges. Drop the `exit 0` once the backlog
+      # is cleared to make this a hard gate.
       - name: npm audit (high severity and above)
         run: |
           set +e
@@ -192,18 +193,24 @@ jobs:
             tail -n 20 audit.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          exit $status
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::npm audit reported high-severity advisories in ${{ matrix.workspace }} (advisory only)."
+          fi
+          exit 0
 
   dependency-review:
     name: Dependency review
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # Requires GitHub's Dependency graph, which is disabled on this repository
+    # (Settings → Code security). Non-blocking until it is turned on.
     permissions:
       contents: read
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/dependency-review-action@v4
+        continue-on-error: true
         with:
           # Only newly introduced dependencies are gated; the pre-existing
           # advisories are reported by the advisory-only `audit` job.
