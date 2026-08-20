@@ -55,9 +55,6 @@ jobs:
     name: Frontend (${{ matrix.task }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # `soft_fail` keeps the pipeline green for checks that are broken in the
-    # baseline repository (see docs/CICD.md); flip it off once fixed.
-    continue-on-error: ${{ matrix.soft_fail == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -83,6 +80,9 @@ jobs:
 
       - name: Run ${{ matrix.task }}
         working-directory: frontend
+        # `soft_fail` marks checks that are broken in the baseline repository
+        # (see docs/CICD.md) as non-blocking; drop it once they are fixed.
+        continue-on-error: ${{ matrix.soft_fail == true }}
         run: ${{ matrix.command }}
 
       - name: Upload coverage report
