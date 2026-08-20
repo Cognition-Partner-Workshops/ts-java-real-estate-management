@@ -1,0 +1,219 @@
+name: CD
+
+# DEMO PIPELINE — every AWS identifier below is a MOCK placeholder.
+# Nothing is pushed to ECR and nothing is deployed to ECS unless the repository
+# is configured with real values AND `vars.DEPLOY_ENABLED == 'true'`.
+# See docs/CICD.md for the swap-to-real checklist.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        default: staging
+        options: [staging, production]
+
+concurrency:
+  group: cd-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Mock defaults — override with Actions variables (Settings > Variables).
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID || '123456789012' }}
+  ECR_REGISTRY: ${{ vars.ECR_REGISTRY || '123456789012.dkr.ecr.us-east-1.amazonaws.com' }}
+  ECR_REPOSITORY_FRONTEND: ${{ vars.ECR_REPOSITORY_FRONTEND || 'demo/rem-frontend' }}
+  ECR_REPOSITORY_BACKEND: ${{ vars.ECR_REPOSITORY_BACKEND || 'demo/rem-backend' }}
+  # `DEPLOY_ENABLED` is the master guard: unset/false => dry run only.
+  DEPLOY_ENABLED: ${{ vars.DEPLOY_ENABLED || 'false' }}
+
+jobs:
+  build-images:
+    name: Build & push images (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # required for OIDC role assumption
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: frontend
+            context: frontend
+          - component: backend
+            context: backend-fastify
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Resolve image coordinates
+        id: image
+        run: |
+          if [ "${{ matrix.component }}" = "frontend" ]; then
+            repo="${ECR_REPOSITORY_FRONTEND}"
+          else
+            repo="${ECR_REPOSITORY_BACKEND}"
+          fi
+          echo "uri=${ECR_REGISTRY}/${repo}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      # Real credentials are only requested when the deploy guard is on.
+      # Mock role ARN: arn:aws:iam::123456789012:role/demo-github-oidc-deploy
+      - name: Configure AWS credentials (OIDC, no long-lived keys)
+        if: ${{ env.DEPLOY_ENABLED == 'true' }}
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN || format('arn:aws:iam::{0}:role/demo-github-oidc-deploy', env.AWS_ACCOUNT_ID) }}
+          role-session-name: gha-build-${{ matrix.component }}-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        if: ${{ env.DEPLOY_ENABLED == 'true' }}
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Build image (and push when deploys are enabled)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ matrix.context }}
+          # Guarded: under mock credentials the image is built but never pushed.
+          push: ${{ env.DEPLOY_ENABLED == 'true' }}
+          tags: |
+            ${{ steps.image.outputs.uri }}:${{ steps.image.outputs.tag }}
+            ${{ steps.image.outputs.uri }}:latest
+          cache-from: type=gha,scope=cd-${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=cd-${{ matrix.component }}
+
+      - name: Dry-run notice
+        if: ${{ env.DEPLOY_ENABLED != 'true' }}
+        run: |
+          echo "::notice title=Mock mode::Built ${{ steps.image.outputs.uri }}:${{ steps.image.outputs.tag }} without pushing (DEPLOY_ENABLED != 'true')."
+
+  deploy-staging:
+    name: Deploy to staging
+    needs: [build-images]
+    if: ${{ github.event_name == 'push' || inputs.environment == 'staging' || inputs.environment == 'production' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # GitHub Environment "staging": add reviewers here for a gate if desired.
+    environment:
+      name: staging
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER_STAGING || 'demo-staging-cluster' }}
+      ECS_SERVICE_FRONTEND: ${{ vars.ECS_SERVICE_FRONTEND_STAGING || 'demo-staging-rem-frontend' }}
+      ECS_SERVICE_BACKEND: ${{ vars.ECS_SERVICE_BACKEND_STAGING || 'demo-staging-rem-backend' }}
+      # Kubernetes equivalents, kept for teams deploying to EKS instead of ECS.
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE_STAGING || 'demo-staging' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ env.DEPLOY_ENABLED == 'true' }}
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN_STAGING || format('arn:aws:iam::{0}:role/demo-staging-github-oidc-deploy', env.AWS_ACCOUNT_ID) }}
+          role-session-name: gha-deploy-staging-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy services
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for service in "$ECS_SERVICE_FRONTEND" "$ECS_SERVICE_BACKEND"; do
+            if [ "${DEPLOY_ENABLED}" = "true" ]; then
+              aws ecs update-service \
+                --cluster "$ECS_CLUSTER" \
+                --service "$service" \
+                --force-new-deployment \
+                --region "$AWS_REGION"
+              aws ecs wait services-stable \
+                --cluster "$ECS_CLUSTER" \
+                --services "$service" \
+                --region "$AWS_REGION"
+            else
+              # Mock mode: print the exact call that would be made.
+              echo "[dry-run] aws ecs update-service --cluster $ECS_CLUSTER --service $service --force-new-deployment --region $AWS_REGION"
+              echo "[dry-run] image: ${ECR_REGISTRY}/${ECR_REPOSITORY_BACKEND}:${IMAGE_TAG::7} / ${ECR_REGISTRY}/${ECR_REPOSITORY_FRONTEND}:${IMAGE_TAG::7}"
+              echo "[dry-run] k8s namespace (EKS variant): $K8S_NAMESPACE"
+            fi
+          done
+
+      - name: Smoke check
+        run: |
+          url="${{ vars.STAGING_HEALTHCHECK_URL || 'https://rem-staging.demo.invalid/healthz' }}"
+          if [ "${DEPLOY_ENABLED}" = "true" ]; then
+            curl --fail --silent --show-error --retry 5 --retry-delay 10 "$url"
+          else
+            echo "[dry-run] would curl $url"
+          fi
+
+  deploy-production:
+    name: Deploy to production
+    needs: [deploy-staging]
+    if: ${{ github.event_name == 'push' || inputs.environment == 'production' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Manual approval gate: configure required reviewers on the "production"
+    # GitHub Environment (Settings > Environments > production).
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL || 'https://rem.demo.invalid' }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER_PRODUCTION || 'demo-prod-cluster' }}
+      ECS_SERVICE_FRONTEND: ${{ vars.ECS_SERVICE_FRONTEND_PRODUCTION || 'demo-prod-rem-frontend' }}
+      ECS_SERVICE_BACKEND: ${{ vars.ECS_SERVICE_BACKEND_PRODUCTION || 'demo-prod-rem-backend' }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE_PRODUCTION || 'demo-prod' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ env.DEPLOY_ENABLED == 'true' }}
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_OIDC_ROLE_ARN_PRODUCTION || format('arn:aws:iam::{0}:role/demo-prod-github-oidc-deploy', env.AWS_ACCOUNT_ID) }}
+          role-session-name: gha-deploy-production-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy services
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for service in "$ECS_SERVICE_FRONTEND" "$ECS_SERVICE_BACKEND"; do
+            if [ "${DEPLOY_ENABLED}" = "true" ]; then
+              aws ecs update-service \
+                --cluster "$ECS_CLUSTER" \
+                --service "$service" \
+                --force-new-deployment \
+                --region "$AWS_REGION"
+              aws ecs wait services-stable \
+                --cluster "$ECS_CLUSTER" \
+                --services "$service" \
+                --region "$AWS_REGION"
+            else
+              echo "[dry-run] aws ecs update-service --cluster $ECS_CLUSTER --service $service --force-new-deployment --region $AWS_REGION"
+              echo "[dry-run] image tag: ${IMAGE_TAG::7}, k8s namespace (EKS variant): $K8S_NAMESPACE"
+            fi
+          done
+
+      - name: Smoke check
+        run: |
+          url="${{ vars.PRODUCTION_HEALTHCHECK_URL || 'https://rem.demo.invalid/healthz' }}"
+          if [ "${DEPLOY_ENABLED}" = "true" ]; then
+            curl --fail --silent --show-error --retry 5 --retry-delay 10 "$url"
+          else
+            echo "[dry-run] would curl $url"
+          fi
